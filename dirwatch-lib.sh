@@ -1,9 +1,9 @@
 #!/bin/bash
 
 libdir=/usr/libexec/dirwatch
-duration_ts=/opt/vnl/Tools/GetTSFileDuration
+duration_ts=$libdir/GetTSFileDuration
 duration_mxf=$libdir/mxfdump
-duration_mov=/opt/vnl/Tools/ReadMPEG
+duration_mov=$libdir/ReadMPEG
 sleep_default=120
 
 logpath=/var/log/dirwatchd
