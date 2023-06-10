@@ -22,3 +22,16 @@ Copy dirwatchd.init to your /etc/ init directory
 Edit dirwatchd.conf and run dirwatchd
 
 ```
+dirwatchd.conf is pretty self explanatory
+External scripts can be called with a combination of following abbreviations:
+```
+# %n - name of the file created/deleted
+# %e - event name: "event_delete" or "event_create"
+# %p - path that will be watched, as specified in config file
+# %d - actual, full directory path where the event occured (that is, where %n was created/deleted)
+# %d and %p have extra feature: e.g %d[4] is THE FIFTH ELEMENT (I love this movie) (of the path)
+
+```
+
+dirwatch-lib.sh is an example file with some helper functions, like computing the duration
+of a video file etc. These are just examples and the tools like ReadMPEG are not provided.
