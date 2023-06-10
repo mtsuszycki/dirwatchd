@@ -1,0 +1,62 @@
+#!/bin/bash
+#
+#       /etc/rc.d/init.d/dirwatch
+#
+#
+#
+#
+
+# Source function library.
+. /etc/init.d/functions
+
+DIR=/usr/sbin/
+PRG=dirwatchd
+CFG=/etc/dirwatchd.conf
+start() {
+        echo -n "Starting : $PRG "
+	cd $DIR
+	daemon $DIR/$PRG $CFG
+	RETVAL=$?
+        touch /var/lock/subsys/dirwatchd
+        return $RETVAL
+}
+
+stop() {
+        echo -n "Shutting down : $PRG "
+	killproc $PRG 
+	RETVAL=$?
+        echo
+        [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/dirwatchd;
+        return $RETVAL
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    status)
+	status $PRG
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    condrestart)
+	 [ -f /var/lock/subsys/crond ] && restart || :
+	;; 
+    reload)
+
+#    start)
+
+	[ -f /var/lock/subsys/ ] && restart || :
+        ;;
+    *)
+        echo "Usage:  {start|stop|status|reload|restart[|probe]"
+        exit 1
+        ;;
+esac
+exit $?
+

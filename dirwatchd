@@ -1,0 +1,348 @@
+#!/usr/bin/perl -w 
+
+
+use strict;
+use File::Find;
+use File::Spec;
+use POSIX;
+use File::stat;
+use File::Basename;
+use Sys::Syslog;
+use Linux::Inotify2;
+use subs qw(dbg say delwhite config_load print_event dump_config daemonize sigterm canonpath);
+
+use constant { DEBUG => 1, FORK_DELAY => 5, FORK_GROUP => 10 };
+
+my %confdirs = ();
+my %children = ();  # pid hash
+my %running = ();   # path hash
+my $progname = $0; $progname =~ s/(.*)\///;
+my $is_daemon = 0;
+my $sigchild_received = 0;
+
+# all dirs (lets call them parent-root) specified in a config files are stored in %confdirs
+# all dirs that are watched are stored in %alldirs 
+# $alldirs{some_dir} points to its parent-root (or the dir itself) for example:
+# $alldirs{'/tmp/test/dir1/dir2'} => '/tmp/test' 
+# if '/tmp/test (subdirs) was specified in a config 
+
+sub config_load
+{
+	my $config_file = shift;
+	my %cfg = ();
+	my %keywords = ( 'event_create' => 1, 'event_delete' => 1, 
+			'subdirs' => 1, 'follow_symlinks' =>1);
+	open(CFG, "<$config_file") or log_exit(1, "Cannot open config $config_file: $!");
+	while (<CFG>) {
+		next if $_ =~ /^[#\n]/;
+		log_exit(2, "Cannot parse $config_file, line $.")
+			if ($_ !~ /^(.*)\s+\((.*)\)\s+=\s+(.*)/);
+		my ($dir, $options, $script) = ($1, $2, $3); 
+		delwhite($dir);
+
+		$dir =~ s/\/+$//;	 		# remove trailing /s 		
+		my @o = split /,/, $options;		# parse directory options
+		scalar(@o) or log_exit(3, "No options $config_file, line $., token $options");
+		
+		my %opts = (watch_events=>0, follow_symlinks=>0, subdirs=>0, dircount=>0);
+		for(my $i = 0; $i < scalar(@o); $i++) {
+			# set inotify events to watch for the directory
+			my $opt = delwhite $o[$i];
+			log_exit(4, "Error: unknown option $opt in $config_file, line $.") 
+				if (!exists($keywords{$opt}));
+			if ($opt =~ 'event_delete') {
+				$opts{watch_events} |= IN_DELETE | IN_MOVED_FROM;
+				$opts{event_name} = 'event_delete';
+				next;
+			}
+			if ($opt =~ 'event_create') {
+				$opts{watch_events} |= IN_CLOSE_WRITE | IN_MOVED_TO;
+				$opts{event_name} = 'event_create';
+				next;
+			}
+			$opts{$opt} = 1;
+		}
+		$opts{script} = $script	;
+		$cfg{$dir} = { %opts };
+	}	
+	close(CFG);
+	return %cfg;
+}
+
+sub mysigchild
+{
+	$sigchild_received++;
+}
+
+sub do_sigchild 
+{
+	my $pid;
+	while (($pid = waitpid(-1,WNOHANG)) > 0) {
+		my ($p, $s, $o) = ($children{$pid}{path}, $children{$pid}{script}, $children{$pid}{script_opts});
+
+		dbg "--- Sig child received for $pid, $p";
+		delete $children{$pid};
+		# $running{$pid} is > 1 only if there were more events for the file 
+		# while the first executed script was running
+		# and we would have run more scripts (but didn't to avoid flood)
+		if ($running{$p} > 1) {
+			say "Last died, need to run $s $p";
+			delete $running{$p};
+			do_fork_exec($s, $o, $p);
+			next;
+		}
+		delete $running{$p};
+	}
+}
+
+sub do_fork_exec
+{
+	my ($script, $opts, $path) = @_;
+	my $pid;
+
+	if (!defined ($pid = fork)) {
+		alrm("Cannot fork for $script $opts");
+		return;
+	}
+	if (!$pid) {
+		exec "$script $opts" or alrm("Cannot exec $script $opts: $!");
+		exit; 
+	}
+	dbg ("fork OK: $pid, $script, $opts");
+	$children{$pid} = { count=>1, path=>$path, script=>$script, script_opts=>$opts };
+	$running{$path} = 1;
+}
+
+sub run_script
+{
+	my ($parent, $dir, $file, $event) = @_;
+	my $script_opt = $confdirs{$parent}{script};	# we keep config options only for parent
+	my ($script_path, $tmp);	
+	my $cpath = canonpath("$dir/$file");	
+	# got event but the previous script is already running
+	if (exists($running{$cpath})) { 
+		$running{$cpath}++;
+		dbg "wont' run, script already running for $cpath";
+		return;
+	}
+	$script_opt =~ /^([^\s]+)\s+(.*)$/;
+	($script_path, $script_opt) = ($1, $2);
+
+	# handle things like %d[4] (part of the real path) as script options	
+	$tmp = $dir;
+	$tmp =~ s/^\/*//; 	# remove leading / so $dirsplit[0] is first elem
+	my @dirsplit = split '/', $tmp;
+	dbg "-- $dir $tmp --";
+	$script_opt =~ s/(%d\[(.+)\])/$dirsplit[$2]/g;
+	
+	# handle things like %p[4] (part of the config path) as script options	
+	$tmp = $parent;
+	$tmp =~ s/^\/*//; 	
+	
+	my @confdir_split = split '/', $tmp;
+	$script_opt =~ s/(%p\[(.+)\])/$confdir_split[$2]/g;
+
+	# parse script definition and substitute %n, %e etc.
+	my %replace = (
+		'%n' => $file,
+		'%d' => $dir,     	# real path received from inotify
+		'%e' => $event,
+		'%p' => $parent		# path as specified in a config
+	);
+	my $regex = join "|", keys %replace;
+	$regex = qr/$regex/;
+	$script_opt =~ s/($regex)/$replace{$1}/g;
+	if (!stat($script_path)) {
+		alrm("Cannot stat $script_path: $!");
+		return;
+	}
+	dbg "RUN: $script_path $script_opt";
+	do_fork_exec($script_path, $script_opt, canonpath "$dir/$file");
+}
+
+sub fork_throttle
+{
+	my $forks = shift;
+	if (++$$forks > FORK_GROUP) {
+		dbg "Fork throttle, sleeping ".FORK_DELAY;
+		local $SIG{CHLD} = undef;
+		sleep FORK_DELAY;
+		$$forks = 1;
+	}
+}
+	
+( printf "\n\nUsage: $progname config_file\n\n" and exit(1) ) if (scalar(@ARGV) != 1);
+my %alldirs = ();	# hash of all dirs watched, value is root dir from conf file 
+%confdirs = config_load $ARGV[0];
+
+my $inotify = new Linux::Inotify2() or log_exit(1, "Unable to use inotify: $!");
+
+my $parent_root;	# for sub 'wanted' below to see this var
+$SIG{'CHLD'} = 'mysigchild';
+say "Startup OK, read ".scalar(keys(%confdirs))." entries from config ($ARGV[0])";
+$SIG{'TERM'} = 'sigterm';
+daemonize;
+
+# create inotify watch objects for each directory and its subdirectories if 'subdir' option was used
+
+my $forks_in_loop = 0;
+foreach my $dir (keys %confdirs) {
+	log_exit(5, "Error: Cannot stat $dir: $!") if (!stat($dir)); 
+	$parent_root = $dir;  	
+	dbg "---------------- PARENT $parent_root";
+	find( { wanted => \&wanted, no_chdir => 1, 
+		follow => $confdirs{$dir}{follow_symlinks}}, $dir );
+	sub wanted { 
+		$dir = $File::Find::dir;
+		my $set_events = $confdirs{$parent_root}{watch_events};
+		# run script for all files found in dirs watched for event_create
+		if (-f) { # && $confdirs{$parent_root}{event_name} =~ 'event_create') {
+			my ($fname, $fdir) = fileparse($_);
+			fork_throttle(\$forks_in_loop);
+			run_script $parent_root, $fdir, $fname, 'event_create';
+			return;
+		}
+		return unless -d;
+		# don't watch subdirectories if 'subdirs' option was set to zero
+		return if (!$confdirs{$parent_root}{subdirs} && $confdirs{$parent_root}{dircount});
+		log_exit(5, "Cannot watch $_: $!") if (!$inotify->watch($_, $set_events)); 
+		$confdirs{$parent_root}{dircount}++;	# subdirectories count
+		$alldirs{$_} = $parent_root;		# remember parent (config dir) for this subdir
+	};
+}
+
+# --------------------- MAIN LOOP ----------------------------
+while (1) {
+	# By default this will block until something is read
+	if ($sigchild_received) {
+		dbg("sigchild_received = ".$sigchild_received);
+		do_sigchild();
+		$sigchild_received = 0;
+	}
+	dbg("NR of children: ".scalar(keys %children));
+	my @events = $inotify->read();
+	if (!scalar(@events)){
+		# read can get interrputed by a sigchild
+		# ignore 'interrupted syscall' and 'no child processes'
+		my $errno = $! + 0;
+		if ($errno != 4 && $errno != 10) {
+			alrm ("inotify read error: $errno $!");
+		}
+	}
+	dbg "inotify received ".scalar(@events)." events";
+	$forks_in_loop = 0;
+	foreach (@events){
+		my ($fname, $fdir) = fileparse($_->fullname);
+		$fdir =~ s/\/$//;		# remove trailing /
+		my $cur_event;
+		print_event $_->mask, $_->fullname;
+
+		if (!exists $alldirs{$fdir}) {
+			alrm ("Cannot find parent for $fdir ($fname)");
+			next;
+		}
+		my $parent_dir = $alldirs{$fdir};
+	
+		dbg "parent: $parent_dir";
+
+		if ($_->IN_CLOSE_WRITE or $_->IN_MOVED_TO) {
+			dbg "NEW FILE: $fdir $fname";
+			$cur_event = 'event_create';
+		}
+		if ($_->IN_DELETE or $_->IN_MOVED_FROM) {
+			dbg "FILE DELETED: $fdir $fname";
+			$cur_event = 'event_delete';
+		}
+		fork_throttle(\$forks_in_loop);
+		run_script $parent_dir, $fdir, $fname, $cur_event;
+	}
+}
+
+#==================================================================
+# some less important stuff, pretty obvious routines
+#==================================================================
+
+# remove leading and trailing white characters
+sub delwhite
+{
+   	my $t = shift || return(0);
+	$t =~ s/^\s+//; 
+	$t =~ s/\s+$//; 
+	return $t;
+}
+
+sub do_log
+{
+	my ($t, $msg) = @_;
+	openlog($progname, "nofatal,ndelay", 'local0') || return;
+	syslog "info", "%s", $msg;
+	closelog;
+}
+
+sub dbg         { do_log('local0', @_) if(DEBUG); }
+sub say         { do_log('local0', @_); }
+sub alrm        { do_log('local0', @_); }         
+
+sub log_exit
+{
+	my ($err, $msg) = @_;
+	print STDERR "$msg\n" if !$is_daemon;
+	alrm("Fatal: ".$msg) if $msg;
+	exit($err); 
+}
+
+# debugging only
+sub print_event
+{
+	my %events = ( 1 => 'IN_ACCESS', 2 => 'IN_MODIFY', 4 => 'IN_ATTRIB', 8 => 'IN_CLOSE_WRITE', 
+	16 => 'IN_CLOSE_NOWRITE', 32 => 'IN_OPEN', 64 => 'IN_MOVED_FROM', 128 => 'IN_MOVED_TO', 
+	256 => 'IN_CREATE', 512 => 'IN_DELETE', 1024 => 'IN_DELETE_SELF', 2048 => 'IN_MOVE_SELF',  
+	-2147483648 => 'IN_ONESHOT', 16777216 => 'IN_ONLYDIR', 33554432 => 'IN_DONT_FOLLOW', 
+	536870912 => 'IN_MASK_ADD', 24 => 'IN_CLOSE', 192 => 'IN_MOVE');
+#4095 => 'IN_ALL_EVENTS'
+
+	my ($e, $n) = @_;
+	foreach my $k (keys %events) {
+		dbg $events{$k}," " if $k&$e;
+	}
+}
+
+sub dump_config 
+{
+	return if !DEBUG;
+	foreach my $k (keys %confdirs) {
+		foreach my $v (keys %{$confdirs{$k}}) {
+			dbg "\t", $v, " ", $confdirs{$k}{$v};
+		}	
+	}
+}
+
+sub daemonize 
+{
+#	chdir '/'               or die "Can't chdir to /: $!";
+	open STDIN, '/dev/null'   or die "Can't read /dev/null: $!";
+        open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
+        defined(my $pid = fork)   or die "Can't fork: $!";
+        exit if $pid;
+	setsid                    or die "Can't start a new session: $!";
+        open STDERR, '>&STDOUT'   or die "Can't dup stdout: $!"; 
+	$is_daemon = 1;
+}
+
+sub sigterm 
+{
+	say "Caught SIG TERM, exiting";
+	exit 0;
+	dbg("Nr of children: ".scalar(keys %children));
+	foreach(keys %children) {
+		dbg "Sending TERM to ".$_;
+		kill -&SIGTERM, $_;
+	}
+	exit 0;
+}
+
+sub canonpath
+{
+	return File::Spec->canonpath(@_);
+}
+
